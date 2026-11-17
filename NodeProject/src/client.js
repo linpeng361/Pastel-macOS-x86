@@ -1,0 +1,263 @@
+import plist from 'plist';
+import {curlRequest, parsePlistLoose, STORE_USER_AGENT, cleanup, fetchStoreURLBag} from './gsa.js';
+import {recoverRedownload, shouldTryRedownload} from './download-recovery.js';
+import {getDeviceGuid} from './device.js';
+import {t} from './i18n.js';
+import {helperUser, runStoreHelper, storeAuthenticationError} from './store-helper.js';
+
+class ApiError extends Error {
+    constructor(message, failureType, customerMessage) {
+        super(message);
+        this.name = 'ApiError';
+        this.failureType = failureType;
+        this.customerMessage = customerMessage;
+        if (Error.captureStackTrace) Error.captureStackTrace(this, ApiError);
+    }
+}
+
+function podPrefix(pod) {
+    return pod ? `p${pod}-` : '';
+}
+
+function tokenExpiredError() {
+    const e = new Error('password token is expired');
+    e.code = 'TOKEN_EXPIRED';
+    return e;
+}
+
+function isPasswordTokenExpiredMessage(message) {
+    return /Your password has changed\.?|password token is expired/i.test(String(message || ''));
+}
+
+// ipaverse treats these StoreServices failures as authentication/session
+// failures. Apple does not consistently include an English error message, so
+// relying on customerMessage alone leaves some expired sessions undetected.
+const AUTH_FAILURE_TYPES = new Set(['-5000', '1008', '2002', '2034', '2042']);
+
+export function isAuthFailureResponse(failureType, customerMessage, statusCode = 200) {
+    return statusCode === 401
+        || statusCode === 403
+        || AUTH_FAILURE_TYPES.has(String(failureType || ''))
+        || isPasswordTokenExpiredMessage(customerMessage);
+}
+
+export function appInfoFailureCode(failureType, customerMessage) {
+    const type = String(failureType || '');
+    const message = String(customerMessage || '').replace(/\u00a0/g, ' ');
+    if (type === '9610') return 'LICENSE_NOT_FOUND';
+    if (type === '2059') return 'APPINFO_BUSY';
+    if (/License not found|Redownload Unavailable with This Apple Account/i.test(message)) {
+        return 'LICENSE_NOT_FOUND';
+    }
+    return type || customerMessage ? 'APPINFO_FAIL' : '';
+}
+
+export function purchaseSuccessKind(response) {
+    const failureType = String(response?.failureType || '');
+    const customerMessage = String(response?.customerMessage || '').replace(/\u00a0/g, ' ');
+
+    // buyProduct is idempotent for an App already in the account library, but
+    // failureType 5002 is also used for unrelated StoreServices failures. Only
+    // accept it when Apple explicitly says that the license already exists.
+    if (failureType === '5002'
+        && /License already exists|already (?:in (?:your|the) library|owned|purchased)/i.test(customerMessage)) {
+        return 'existing';
+    }
+
+    // Match ApplePackage's strict purchase contract. HTTP 500, status=0 by
+    // itself, or a failureType must never be promoted to a successful purchase.
+    if (!failureType
+        && response?._httpStatus === 200
+        && response?.jingleDocType === 'purchaseSuccess'
+        && response?.status === 0) {
+        return 'new';
+    }
+    return '';
+}
+
+const _endpoints = {
+    AppInfo: {
+        url: (guid, pod) => `https://${podPrefix(pod)}buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct?guid=${guid}`,
+        buildBody: ({appIdentifier, appVerId, guid, redownload = false}) => ({
+            creditDisplay: '',
+            guid,
+            salableAdamId: appIdentifier,
+            serialNumber: '0',
+            ...(appVerId && {[redownload ? 'appExtVrsId' : 'externalVersionId']: appVerId}),
+        }),
+    },
+    Redownload: {
+        url: (guid) => `https://downloaddispatch.itunes.apple.com/r/redownload?guid=${guid}`,
+    },
+    purchase: {
+        url: (pod) => `https://${podPrefix(pod)}buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/buyProduct`,
+        buildBody: ({appid, appVerId, guid, pricingParameters = 'STDQ'}) => ({
+            appExtVrsId: appVerId || '0',
+            buyWithoutAuthorization: 'true',
+            hasAskedToFulfillPreorder: 'true',
+            hasDoneAgeCheck: 'true',
+            guid,
+            needDiv: '0',
+            origPage: `Software-${appid}`,
+            origPageLocation: 'Buy',
+            price: '0',
+            pricingParameters,
+            productType: 'C',
+            salableAdamId: appid,
+        }),
+    },
+};
+
+class Store {
+    static get guid() {
+        return getDeviceGuid();
+    }
+
+    static cleanup() {
+        cleanup();
+    }
+
+    // The upstream helper owns SAP signing, AMD provisioning and native auth.
+    static async login(email, password, mfa, previousSession = null, sessionKey = '') {
+        try {
+            const result = await runStoreHelper({
+                command: 'login', email, password, code: mfa || '',
+                guid: this.guid, sessionKey,
+            });
+            return helperUser(result, email);
+        } catch (error) {
+            throw storeAuthenticationError(error);
+        }
+    }
+
+    // 调用 StoreServices 私有接口（volumeStoreDownloadProduct / buyProduct），经系统代理走 curl，
+    // 并复用 authenticate 阶段种下的会话 cookie（volumeStoreDownloadProduct 依赖该会话）。
+    static #storePost(prefix, url, bodyObj, headers, authContext, {redownload = false} = {}) {
+        const body = plist.build(bodyObj);
+        let res = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            res = curlRequest('POST', url, {headers, body, follow: true, timeout: 60, jar: authContext?.cookieJar || null});
+            if (res.status !== 0) break;
+        }
+        if (!res || res.status === 0) {
+            const e = new Error(`${prefix}${t('net_failed_suffix')}`);
+            e.code = 'STORE_FAIL';
+            throw e;
+        }
+        // StoreServices also uses HTTP 403 for an account that does not yet
+        // own an App. Preserve a structured plist response so AppInfo can
+        // distinguish a missing license from an expired session. A bare 403
+        // (or an unreadable 403 body) still means the cached session is no
+        // longer usable.
+        if (res.status === 401) throw tokenExpiredError();
+        if (redownload && res.status === 500 && res.body.length === 0) {
+            const error = new Error('Empty Apple redownload response');
+            error.code = 'EMPTY_REDOWNLOAD_RESPONSE';
+            throw error;
+        }
+        try {
+            return {...parsePlistLoose(res.body, t('ctx_resp')), _httpStatus: res.status};
+        } catch (error) {
+            if (res.status === 403) throw tokenExpiredError();
+            const e = new Error(`${prefix}${t('bad_format_suffix', {message: error.message})}`);
+            e.code = 'STORE_FAIL';
+            throw e;
+        }
+    }
+
+    static async AppInfo(appIdentifier, appVerId, authContext, {listVersions = false} = {}) {
+        const endpoint = _endpoints.AppInfo;
+        const dsid = authContext?.authHeaders?.['X-Dsid'];
+        // 与 ipatool 一致：下载信息请求仅带 DSID 头 + 会话 cookie（不带 X-Token / storefront）。
+        const headers = {
+            'User-Agent': STORE_USER_AGENT,
+            'Content-Type': 'application/x-apple-plist',
+            'iCloud-DSID': dsid,
+            'X-Dsid': dsid,
+        };
+        let parsedResp = this.#storePost(
+            t('label_download_app'),
+            endpoint.url(this.guid, authContext?.pod),
+            endpoint.buildBody({appIdentifier, appVerId, guid: this.guid}),
+            headers,
+            authContext
+        );
+        // Do not hide an expired session behind a fallback availability error.
+        if (isAuthFailureResponse(parsedResp.failureType, parsedResp.customerMessage)) {
+            throw tokenExpiredError();
+        }
+        // Keep the existing empty/5002 fallback, but preserve explicit license,
+        // busy and other structured errors returned by the primary endpoint.
+        if (shouldTryRedownload(parsedResp)) {
+            parsedResp = await recoverRedownload({
+                appIdentifier,
+                versionID: appVerId,
+                loadBag: () => fetchStoreURLBag(this.guid),
+                request: (kind, updateURL) => this.#storePost(
+                    t('label_download_app'),
+                    kind === 'update' ? `${updateURL}?guid=${this.guid}` : _endpoints.Redownload.url(this.guid),
+                    endpoint.buildBody({appIdentifier, appVerId, guid: this.guid, redownload: true}),
+                    headers,
+                    authContext,
+                    {redownload: kind === 'redownload'}
+                ),
+            });
+        }
+        const failureCode = appInfoFailureCode(parsedResp.failureType, parsedResp.customerMessage);
+        if (failureCode === 'APPINFO_BUSY') {
+            const e = new Error(t('appinfo_busy'));
+            e.code = failureCode;
+            throw e;
+        }
+        if (isAuthFailureResponse(parsedResp.failureType, parsedResp.customerMessage)) {
+            throw tokenExpiredError();
+        }
+        if (parsedResp.customerMessage) {
+            const e = new Error(t('appinfo_custom', {msg: parsedResp.customerMessage}));
+            e.code = failureCode;
+            throw e;
+        }
+        if (!parsedResp.songList?.[0]) {
+            const e = new Error(t('appinfo_nodata'));
+            // Apple sometimes reports an unowned free App as status=0 with an
+            // empty songList instead of failureType=9610. Only the version-list
+            // path may interpret that response as a missing license candidate.
+            e.code = failureCode || (listVersions ? 'APPINFO_EMPTY' : 'APPINFO_FAIL');
+            throw e;
+        }
+        return parsedResp;
+    }
+
+    static async purchase(appid, appVerId, authContext) {
+        const endpoint = _endpoints.purchase;
+        const url = endpoint.url(authContext?.pod);
+        // 对齐 ipatool：只有 2059（暂时不可用）才使用 Apple Arcade 的 GAME 参数重试。
+        const headers = {
+            'User-Agent': STORE_USER_AGENT,
+            'Content-Type': 'application/x-apple-plist',
+            ...(authContext?.authHeaders || {}),
+        };
+        for (const pricingParameters of ['STDQ', 'GAME']) {
+            const parsedResp = this.#storePost(t('label_purchase'), url, endpoint.buildBody({appid, appVerId, guid: this.guid, pricingParameters}), headers, authContext);
+            const successKind = purchaseSuccessKind(parsedResp);
+            if (successKind) {
+                const message = successKind === 'existing' ? t('lic_in_library') : t('lic_new');
+                return {...parsedResp, _state: 'success', customerMessage: message};
+            }
+            if (isAuthFailureResponse(parsedResp.failureType, parsedResp.customerMessage)) {
+                throw tokenExpiredError();
+            }
+            if (parsedResp.failureType === '2059' && pricingParameters === 'STDQ') {
+                continue;
+            }
+            const e = new Error(t('license_failed', {msg: parsedResp.customerMessage || parsedResp.failureType || t('lic_fail_msg')}));
+            e.code = 'LICENSE_FAIL';
+            throw e;
+        }
+        const e = new Error(t('license_failed', {msg: t('lic_fail_msg')}));
+        e.code = 'LICENSE_FAIL';
+        throw e;
+    }
+}
+
+export {Store};

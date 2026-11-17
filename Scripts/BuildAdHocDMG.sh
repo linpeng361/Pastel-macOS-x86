@@ -1,0 +1,88 @@
+#!/bin/sh
+set -eu
+
+project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+developer_dir=${DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}
+if [ ! -d "$developer_dir" ]; then
+    developer_dir=/Applications/Xcode.app/Contents/Developer
+fi
+# Keep products outside the iCloud-synced source tree. Finder/iCloud metadata on
+# nested Sparkle bundles is rejected by codesign as resource-fork detritus.
+derived_data=${PASTEL_DERIVED_DATA:-"${TMPDIR:-/tmp}/PastelDistributionDerivedData"}
+output_dir=${PASTEL_OUTPUT_DIR:-"${project_root}/dist"}
+
+export DEVELOPER_DIR="$developer_dir"
+
+# Local distribution requires no Apple Developer membership or certificate.
+# Retain an opt-in identity for users who have configured one.
+release_identity=${PASTEL_SIGNING_IDENTITY:--}
+
+sh "${project_root}/Scripts/VerifyDeviceGUIDImplementation.sh" \
+    "${project_root}/Pastel/PastelApp.swift"
+
+xcodebuild \
+    -project "${project_root}/Pastel.xcodeproj" \
+    -scheme Pastel \
+    -configuration Release \
+    -derivedDataPath "$derived_data" \
+    CODE_SIGN_STYLE=Manual \
+    CODE_SIGN_IDENTITY="$release_identity" \
+    DEVELOPMENT_TEAM= \
+    CODE_SIGNING_ALLOWED=NO \
+    build
+
+app="${derived_data}/Build/Products/Release/Pastel.app"
+node="${app}/Contents/Resources/node/bin/node"
+signer="${app}/Contents/Resources/sap-signer"
+store_helper="${app}/Contents/Resources/store-helper"
+sparkle="${app}/Contents/Frameworks/Sparkle.framework"
+
+test -d "$app"
+# Apply local ad-hoc signatures required by the hardened runtime, with no developer
+# certificate. Keep this order: leaf executables, framework, app.
+codesign --force --sign "$release_identity" "$signer"
+codesign --force --sign "$release_identity" --options runtime \
+    --entitlements "${project_root}/Scripts/NodeJIT.entitlements" "$node"
+codesign --force --sign "$release_identity" --options runtime \
+    --entitlements "${project_root}/Scripts/StoreHelper.entitlements" "$store_helper"
+# A self-signed identity has no Apple Team ID. Enabling Hardened Runtime on the
+# host app would make dyld reject Sparkle under Library Validation even though
+# both signatures are otherwise valid. Node and store-helper retain their own
+# narrowly scoped Hardened Runtime entitlements above.
+codesign --force --sign "$release_identity" "$sparkle"
+codesign --force --sign "$release_identity" "$app"
+
+codesign --verify --strict "$signer"
+codesign --verify --strict "$node"
+codesign --verify --strict "$store_helper"
+codesign --verify --deep --strict "$app"
+
+if codesign -dv --verbose=4 "$app" 2>&1 | grep -F -q 'flags=0x10000(runtime)'; then
+    echo "Release host app unexpectedly has Hardened Runtime enabled." >&2
+    echo "A self-signed host cannot load Sparkle with Library Validation." >&2
+    exit 1
+fi
+
+# Validate Node after every enclosing signature has been applied. Merely checking
+# the entitlement plist would not prove that V8 can create executable JIT pages.
+"$node" -e '
+function hot(value) { return (value * 3 + 7) ^ 0x55; }
+let result = 0;
+for (let index = 0; index < 1000000; index += 1) result = hot(result + index);
+if (!process.versions.node.startsWith("24.") || !Number.isInteger(result)) process.exit(1);
+process.stdout.write(`Node ${process.versions.node} JIT validation passed\n`);
+'
+
+version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${app}/Contents/Info.plist")
+build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${app}/Contents/Info.plist")
+dmg="${output_dir}/Pastel-${version}-build-${build}.dmg"
+staging=$(mktemp -d "${TMPDIR:-/tmp}/pastel-dmg.XXXXXX")
+trap 'rm -rf "$staging"' EXIT HUP INT TERM
+
+mkdir -p "$output_dir"
+ditto "$app" "${staging}/Pastel.app"
+ln -s /Applications "${staging}/Applications"
+rm -f "$dmg"
+hdiutil create -quiet -fs HFS+ -volname Pastel -srcfolder "$staging" -format UDZO "$dmg"
+
+echo "Created ${dmg}"

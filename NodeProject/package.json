@@ -1,0 +1,26 @@
+{
+  "name": "ipatool.js",
+  "version": "0.2.0",
+  "description": "Pastel embedded App Store client for Node.js 24 LTS",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node main.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "axios": "^1.13.1",
+    "axios-cookiejar-support": "^6.0.4",
+    "dotenv": "^17.2.3",
+    "fetch-cookie": "^3.1.0",
+    "getmac": "^6.6.0",
+    "node-stream-zip": "^1.15.0",
+    "p-queue": "^9.0.0",
+    "plist": "^3.1.0",
+    "tough-cookie": "^6.0.0"
+  }
+}
